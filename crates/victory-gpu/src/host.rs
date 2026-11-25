@@ -134,6 +134,50 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// Cached physical RAM sample for admission and scratch-pool decisions.
+pub(crate) fn free_ram_lately() -> Option<u64> {
+    static SAMPLE: Mutex<Option<(u64, Option<u64>)>> = Mutex::new(None);
+    let mut sample = SAMPLE.lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_ms();
+    if let Some((at, value)) = *sample {
+        if now.saturating_sub(at) < 250 {
+            return value;
+        }
+    }
+    let value = available_physical_ram();
+    *sample = Some((now, value));
+    value
+}
+
+/// T2-inspired pressure levels for optional streamed textures only.
+/// Unknown memory measurements are not treated as zero available memory.
+pub(crate) fn streaming_pressure(memory: Option<[u64; 4]>, free: Option<u64>) -> u8 {
+    let Some([budget, used, shared_budget, shared]) = memory else { return 0; };
+    if budget == 0 || budget > 6 << 30 { return 0; }
+    let shared_at = |p: u128| shared_budget != 0 && u128::from(shared) * 100 >= u128::from(shared_budget) * p;
+    let local_at = |p: u128| u128::from(used) * 100 >= u128::from(budget) * p;
+    if free.is_some_and(|v| v < 256 << 20) && (local_at(100) || shared_at(85)) {
+        3
+    } else if shared_at(85) || (local_at(100) && free.is_some_and(|v| v < 768 << 20)) {
+        2
+    } else if shared_at(70) || local_at(90) {
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn streaming_pressure_keeps_large_cards_unchanged_and_detects_low_ram() {
+    let gib = 1u64 << 30;
+    assert_eq!(streaming_pressure(Some([24*gib,24*gib,8*gib,8*gib]),Some(0)),0);
+    assert_eq!(streaming_pressure(Some([4*gib,2*gib,8*gib,0]),None),0);
+    assert_eq!(streaming_pressure(Some([4*gib,4*gib,8*gib,0]),None),1);
+    assert_eq!(streaming_pressure(Some([4*gib,5*gib,8*gib,7*gib]),Some(512<<20)),2);
+    assert_eq!(streaming_pressure(Some([4*gib,5*gib,8*gib,7*gib]),Some(128<<20)),3);
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
@@ -1911,11 +1955,27 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         return;
     }
     let mut freed = Vec::new();
+    // Only reclaim already-idle scratch chunks. Do not shorten the lifetime
+    // of anything still owned by a list or a submission.
+    let most = if keep_freed() && free_ram_lately().is_none_or(|v| v >= 4 << 30) {
+        SPARE_KEPT
+    } else {
+        SPARE_MOST
+    };
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > most {
+            let Some((chunk, size)) = spare.kept.pop() else { break; };
+            spare.bytes -= size;
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+            freed.push(chunk);
+        }
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, most)
             } else {
                 Some(chunk)
             };

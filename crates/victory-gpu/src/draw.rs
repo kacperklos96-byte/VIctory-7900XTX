@@ -2223,7 +2223,20 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (mut per_frame, mut span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        // T2-style pacing for small adapters. Keep descriptor maintenance
+        // running; only bound optional indexed texture upload work.
+        if !baking && memory.is_some_and(|[budget, ..]| budget != 0 && budget <= 6 << 30) {
+            let pressure = crate::host::streaming_pressure(memory, crate::host::free_ram_lately());
+            let (mb, ms) = match pressure {
+                0 => (64, 200),
+                1 => (48, 150),
+                2 => (24, 100),
+                _ => (8, 50),
+            };
+            per_frame = per_frame.min(mb << 20);
+            span = span.min(std::time::Duration::from_millis(ms));
+        }
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)

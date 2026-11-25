@@ -1665,6 +1665,32 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+/// T2's small-card share, adapted to the newer resource implementation.
+/// An explicit user budget is a ceiling, not permission to ignore pressure.
+#[cfg(any(windows, test))]
+fn small_texture_share(budget: u64, asked: Option<u64>, pressure: u8) -> u64 {
+    let whole = asked.unwrap_or(budget / 100 * 34).min(budget);
+    let least = (384 << 20).min(whole);
+    match pressure {
+        0 => whole,
+        1 => (whole / 100 * 85).max(least),
+        2 => (whole / 100 * 75).max(least),
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn small_texture_share_respects_limits_and_pressure() {
+    let budget = 3u64 << 30;
+    let asked = Some(768 << 20);
+    assert_eq!(small_texture_share(budget, asked, 0), 768 << 20);
+    assert!(small_texture_share(budget, asked, 1) < 768 << 20);
+    assert!(small_texture_share(budget, asked, 2) < small_texture_share(budget, asked, 1));
+    assert_eq!(small_texture_share(budget, asked, 3), 0);
+    assert_eq!(small_texture_share(budget, Some(0), 2), 0);
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
@@ -1679,11 +1705,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        mb.trim().parse::<u64>().ok().map(|mb| mb.saturating_mul(1 << 20))
     });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    if let Some([budget, ..]) = memory {
+        if budget != 0 && budget <= 6 << 30 {
+            let pressure = crate::host::streaming_pressure(memory, crate::host::free_ram_lately());
+            return filled < small_texture_share(budget, limit, pressure);
+        }
+    }
     if let Some(limit) = limit {
         return filled < limit;
     }
