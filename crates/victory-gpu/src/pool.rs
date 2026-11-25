@@ -39,7 +39,8 @@ const STAGING_KEPT: usize = 8;
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// Up to [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), with a
+/// smaller cap on low-budget adapters; otherwise [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
@@ -47,7 +48,19 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            // A 4 GiB spare pool is appropriate for a large adapter, not
+            // for an entry-level card. Keep at most 1/16 of the current
+            // local budget in empty blocks on small adapters, also respecting
+            // the headroom to the ordinary 85% pressure threshold.
+            if budget <= 6 << 30 {
+                let headroom = (budget.saturating_mul(85) / 100).saturating_sub(used);
+                let affordable = (headroom.min(budget / 16) / BLOCK) as usize;
+                affordable.clamp(SPARE, SPARE_KEPT)
+            } else {
+                SPARE_KEPT
+            }
+        },
         _ => SPARE,
     }
 }
@@ -554,7 +567,13 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([24 << 30, 20 << 30, 0, 0]), true), SPARE_KEPT);
+        // A 4 GiB adapter retains at most 256 MiB of empty blocks, and
+        // near the threshold returns to the two-block safety reserve.
+        assert_eq!(spares(Some([4 << 30, 1 << 30, 0, 0]), true), 4);
+        assert_eq!(spares(Some([4 << 30, 3400 << 20, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([3 << 30, 1 << 30, 0, 0]), true), 3);
+        assert_eq!(spares(Some([0, 0, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);

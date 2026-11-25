@@ -299,8 +299,24 @@ fn back_list(kind: u32) -> This {
     list
 }
 
+/// Leave cores available for the title, submission and streaming workers.
+fn default_threads(processors: usize) -> usize {
+    (processors / 3).clamp(1, 8)
+}
+
+#[cfg(test)]
+#[test]
+fn thin_workers_scale_to_small_cpus() {
+    assert_eq!(default_threads(1), 1);
+    assert_eq!(default_threads(6), 2);
+    assert_eq!(default_threads(12), 4);
+    assert_eq!(default_threads(24), 8);
+    assert_eq!(default_threads(64), 8);
+}
+
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let processors = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| default_threads(processors)).clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
