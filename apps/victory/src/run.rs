@@ -98,6 +98,7 @@ pub fn run(
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
+    victory_hle::modules::files::protect(title_dir).context("protecting the title package from writes")?;
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });

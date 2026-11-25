@@ -13,11 +13,12 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
-use std::ffi::{CStr, c_char, c_void};
-use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::ffi::{CStr, OsString, c_char, c_void};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use windows_sys::Win32::Foundation::SetLastError;
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
@@ -258,6 +259,112 @@ fn widen(mode: *const c_char) -> Vec<u16> {
 type Handle = *mut c_void;
 type File = *mut c_void;
 
+// Package write guard adapted from the T2 source (GPL-3.0-or-later).
+// This guards the path-taking imports below, not arbitrary native code.
+static READ_ONLY: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+pub fn protect(root: &Path) -> std::io::Result<()> {
+    let root = std::fs::canonicalize(root)?;
+    let mut all = READ_ONLY.lock().unwrap_or_else(|e| e.into_inner());
+    if !all.contains(&root) {
+        tracing::info!(root = %root.display(), "the title cannot write to this folder through guarded imports");
+        all.push(root);
+    }
+    Ok(())
+}
+
+fn final_path(path: &[u16]) -> Option<PathBuf> {
+    let path = std::path::absolute(OsString::from_wide(path)).ok()?;
+    let mut rest = Vec::new();
+    let mut at: &Path = &path;
+    loop {
+        if let Ok(found) = std::fs::canonicalize(at) {
+            return Some(rest.iter().rev().fold(found, |p, name| p.join(name)));
+        }
+        rest.push(at.file_name()?);
+        at = at.parent()?;
+    }
+}
+
+fn read_only(path: &[u16], whole: bool) -> bool {
+    let all = READ_ONLY.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if all.is_empty() { return false; }
+    let path = path.split(|&c| c == 0).next().unwrap_or_default();
+    // An unresolvable mutation path is refused when the guard is active.
+    let Some(path) = final_path(path) else { return true; };
+    all.iter().any(|root| path.starts_with(root) || (whole && root.starts_with(&path)))
+}
+
+fn refuse(path: &Wide, whole: bool) -> bool {
+    if let Some(host) = &path.1 { return read_only(host, whole); }
+    if path.0.is_null() { return false; }
+    // SAFETY: the caller passes a NUL-terminated path.
+    let units = unsafe {
+        let len = (0..).take_while(|&i| *path.0.add(i) != 0).count();
+        std::slice::from_raw_parts(path.0, len)
+    };
+    read_only(units, whole)
+}
+
+fn refuse_narrow(path: *const c_char, host: Option<&[u16]>, whole: bool) -> bool {
+    if let Some(host) = host { return read_only(host, whole); }
+    if path.is_null() { return false; }
+    // Decode non-virtual paths using the same code page as the host.
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    let Ok(len) = i32::try_from(bytes.len()) else { return true; };
+    let wide = unsafe {
+        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+        if n <= 0 { return true; }
+        let mut wide = vec![0u16; n as usize];
+        if MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n) != n {
+            return true;
+        }
+        wide
+    };
+    read_only(&wide, whole)
+}
+
+const ACCESS_DENIED: u32 = 5;
+const INVALID_HANDLE: Handle = usize::MAX as Handle;
+fn denied<T>(value: T) -> T {
+    unsafe { SetLastError(ACCESS_DENIED) };
+    value
+}
+fn denied_crt<T>(value: T) -> T {
+    host!("ucrtbase.dll", "_set_errno": extern "C" fn(i32) -> i32)(13);
+    denied(value)
+}
+fn denied_s(out: *mut File) -> i32 {
+    if !out.is_null() { unsafe { out.write(std::ptr::null_mut()) }; }
+    denied_crt(13)
+}
+
+fn open_for_reading(access: u32, disposition: u32, flags: u32) -> Option<u32> {
+    const CHANGES: u32 = 0x4000_0000 | 0x1000_0000 | 0x0200_0000 | 0xd_0000 | 0x156;
+    (access & CHANGES == 0 && flags & 0x0400_0000 == 0 && [3, 4].contains(&disposition)).then_some(3)
+}
+fn guarded_open(access: u32, disposition: u32, flags: u32, refused: impl FnOnce() -> bool) -> Option<u32> {
+    let reading = open_for_reading(access, disposition, flags);
+    if reading == Some(disposition) || !refused() { Some(disposition) } else { reading }
+}
+fn mode_writes(mode: impl Iterator<Item = u16>) -> bool {
+    mode.take_while(|&c| c != 0 && c != u16::from(b','))
+        .any(|c| b"wa+".map(u16::from).contains(&c))
+}
+fn wide_mode_writes(mode: *const u16) -> bool {
+    !mode.is_null() && mode_writes((0..).map(|i| unsafe { *mode.add(i) }))
+}
+fn narrow_mode_writes(mode: *const c_char) -> bool {
+    mode_writes(widen(mode).into_iter())
+}
+fn guarded_flags(flags: i32, refused: impl FnOnce() -> bool) -> Option<i32> {
+    const CHANGES: i32 = 0x1 | 0x2 | 0x8 | 0x40 | 0x200;
+    const CREATE: i32 = 0x100;
+    if flags & (CHANGES | CREATE) == 0 || !refused() { return Some(flags); }
+    (flags & CHANGES == 0).then_some(flags & !CREATE)
+}
+fn openmode_writes(mode: i32) -> bool { mode & (0x2 | 0x8 | 0x10) != 0 }
+
 // kernel32 and its file API sets.
 
 pub extern "system" fn CreateFileW(
@@ -270,6 +377,7 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    let Some(disposition) = guarded_open(access, disposition, flags, || refuse(&p, false)) else { return denied(INVALID_HANDLE); };
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -290,7 +398,9 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    match narrow(path) {
+    let host = narrow(path);
+    let Some(disposition) = guarded_open(access, disposition, flags, || refuse_narrow(path, host.as_deref(), false)) else { return denied(INVALID_HANDLE); };
+    match host {
         Some(p) => {
             host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 p.as_ptr(),
@@ -325,6 +435,8 @@ pub extern "system" fn CreateFile2(
     params: *const c_void,
 ) -> Handle {
     let p = wide(path);
+    let flags = if params.is_null() { 0 } else { unsafe { params.cast::<u32>().add(2).read_unaligned() } };
+    let Some(disposition) = guarded_open(access, disposition, flags, || refuse(&p, false)) else { return denied(INVALID_HANDLE); };
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,
@@ -335,7 +447,9 @@ pub extern "system" fn CreateFile2(
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
-    match narrow(path) {
+    let host = narrow(path);
+    if refuse_narrow(path, host.as_deref(), true) { return denied(0); }
+    match host {
         Some(p) => {
             host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.as_ptr())
         }
@@ -347,16 +461,19 @@ pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
 
 pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
     let p = wide(path);
+    if refuse(&p, true) { return denied(0); }
     host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
     let p = wide(path);
+    if refuse(&p, true) { return denied(0); }
     host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
     let p = wide(path);
+    if refuse(&p, false) { return denied(0); }
     host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)(
         p.ptr(),
         attributes,
@@ -380,6 +497,11 @@ pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
 
 pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
     let p = wide(path);
+    if refuse(&p, false) {
+        let attributes = host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr());
+        unsafe { SetLastError(if attributes != u32::MAX { 183 } else { ACCESS_DENIED }) };
+        return 0;
+    }
     host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)(
         p.ptr(),
         security,
@@ -474,6 +596,7 @@ pub extern "system" fn FindFirstFileExW(
 
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
     let (from, to) = (wide(from), wide(to));
+    if refuse(&from, true) || refuse(&to, true) { return denied(0); }
     host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
         from.ptr(),
         to.ptr(),
@@ -500,11 +623,13 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
     let p = wide(path);
+    if wide_mode_writes(mode) && refuse(&p, false) { return denied_crt(std::ptr::null_mut()); }
     host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
 }
 
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
     let p = wide(path);
+    if wide_mode_writes(mode) && refuse(&p, false) { return denied_s(out); }
     host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
         out,
         p.ptr(),
@@ -514,6 +639,7 @@ pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) 
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
     let p = wide(path);
+    if wide_mode_writes(mode) && refuse(&p, false) { return denied_crt(std::ptr::null_mut()); }
     host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
         p.ptr(),
         mode,
@@ -577,7 +703,9 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
-    match narrow(path) {
+    let host = narrow(path);
+    if narrow_mode_writes(mode) && refuse_narrow(path, host.as_deref(), false) { return denied_crt(std::ptr::null_mut()); }
+    match host {
         Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
             p.as_ptr(),
             widen(mode).as_ptr(),
@@ -591,7 +719,9 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 }
 
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
-    match narrow(path) {
+    let host = narrow(path);
+    if narrow_mode_writes(mode) && refuse_narrow(path, host.as_deref(), false) { return denied_s(out); }
+    match host {
         Some(p) => {
             host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
                 out,
@@ -610,7 +740,9 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 /// `_open(path, flags[, mode])` is variadic; on x64 the optional integer
 /// travels in the same register either way, so it is passed on as is.
 pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
-    match narrow(path) {
+    let host = narrow(path);
+    let Some(flags) = guarded_flags(flags, || refuse_narrow(path, host.as_deref(), false)) else { return denied_crt(-1); };
+    match host {
         Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
             p.as_ptr(),
             flags,
@@ -625,6 +757,7 @@ pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
 /// See [`_open`]; used by libHttpClient.
 pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
     let p = wide(path);
+    let Some(flags) = guarded_flags(flags, || refuse(&p, false)) else { return denied_crt(-1); };
     host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
         p.ptr(),
         flags,
@@ -654,7 +787,9 @@ pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
 }
 
 pub extern "C" fn remove(path: *const c_char) -> i32 {
-    match narrow(path) {
+    let host = narrow(path);
+    if refuse_narrow(path, host.as_deref(), true) { return denied_crt(-1); }
+    match host {
         Some(p) => host!("ucrtbase.dll", "_wremove": extern "C" fn(*const u16) -> i32)(p.as_ptr()),
         None => host!("ucrtbase.dll", "remove": extern "C" fn(*const c_char) -> i32)(path),
     }
@@ -662,11 +797,13 @@ pub extern "C" fn remove(path: *const c_char) -> i32 {
 
 pub extern "C" fn _wchmod(path: *const u16, mode: i32) -> i32 {
     let p = wide(path);
+    if refuse(&p, false) { return denied_crt(-1); }
     host!("ucrtbase.dll", "_wchmod": extern "C" fn(*const u16, i32) -> i32)(p.ptr(), mode)
 }
 
 pub extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
     let p = wide(path);
+    if refuse(&p, false) { return denied_crt(-1); }
     host!("ucrtbase.dll", "_wutime64": extern "C" fn(*const u16, *mut c_void) -> i32)(
         p.ptr(),
         times,
@@ -681,6 +818,7 @@ const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
     let p = wide(path);
+    if openmode_writes(mode) && refuse(&p, false) { return denied_crt(std::ptr::null_mut()); }
     host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
         p.ptr(),
         mode,
@@ -690,7 +828,9 @@ extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File 
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
-    match narrow(path) {
+    let host = narrow(path);
+    if openmode_writes(mode) && refuse_narrow(path, host.as_deref(), false) { return denied_crt(std::ptr::null_mut()); }
+    match host {
         Some(p) => {
             host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
                 p.as_ptr(),
@@ -770,6 +910,18 @@ mod tests {
 
     fn w(s: &str) -> Vec<u16> {
         s.encode_utf16().chain([0]).collect()
+    }
+
+    #[test]
+    fn package_open_policy_refuses_mutation() {
+        assert_eq!(guarded_open(0x80000000, 3, 0, || true), Some(3));
+        assert_eq!(guarded_open(0x80000000, 4, 0, || true), Some(3));
+        assert_eq!(guarded_open(0x40000000, 3, 0, || true), None);
+        assert_eq!(guarded_open(0, 3, 0x04000000, || true), None);
+        assert_eq!(guarded_flags(0x100, || true), Some(0));
+        assert_eq!(guarded_flags(1, || true), None);
+        assert!(mode_writes("r+b".encode_utf16()));
+        assert!(!mode_writes("rb".encode_utf16()));
     }
 
     #[test]

@@ -23,12 +23,8 @@ if ($BuildOnly) { return }
 $Exe = (Resolve-Path -LiteralPath $Exe).Path
 if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw 'Executable not found.' }
 if (-not (Test-Path -LiteralPath (Join-Path $root 'target\diag\victory.exe'))) { throw 'Build first using -Build.' }
-# This upstream fork does not include T2's package write guard. Use an isolated
-# copy of an authorized title, not the original package.
-$original = Join-Path (Split-Path $root -Parent) 'game'
-if ($Exe.StartsWith($original.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'Use a separate authorized title copy. This fork has not yet integrated the T2 package write guard.'
-}
+# The runtime protects the package through its path-taking file imports.
+# This is not an OS sandbox; use a separate copy if strict isolation is required.
 $previous = @{}
 Get-ChildItem Env:VICTORY_* | ForEach-Object { $previous[$_.Name] = $_.Value }
 try {
